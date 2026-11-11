@@ -3,21 +3,20 @@
 # ssb-warp-fix.sh — Cloudflare WARP (warp-cli) repair + verification for SSB nodes
 #
 # ЧТО ЛЕЧИТ
-#   Симптом: warp-cli рапортует "Connected", туннель поднят, но SOCKS5-прокси
-#   127.0.0.1:40000 отдаёт "socks5: request rejected, code=4" почти на всё,
-#   кроме домён­ов Cloudflare. В итоге всё, что в sing-box привязано к outbound
-#   "warp" (все .ru/.su, openai/anthropic/xai, tiktok, habr/rutracker),
-#   недоступно у клиентов.
+#   1) Симптом: warp-cli рапортует "Connected", туннель поднят, но SOCKS5-прокси
+#      127.0.0.1:40000 отдаёт "socks5: request rejected, code=4" почти на всё,
+#      кроме домёнов Cloudflare. В итоге всё, что в sing-box привязано к outbound
+#      "warp" (.ru/.su, openai/anthropic/xai, tiktok, habr/rutracker), недоступно.
+#      Причина: регистрация устройства на стороне Cloudflare «разъехалась» —
+#      handshake живой, но выход обслуживает только периферию Cloudflare.
+#      Лечение: новая регистрация (registration delete + new).
 #
-#   Причина (поле, проверено): регистрация устройства на стороне Cloudflare
-#   «разъехалась» — handshake и MASQUE живые, но выход обслуживает только
-#   собственную периферию Cloudflare. Лечится НОВОЙ регистрацией:
-#       warp-cli registration delete && warp-cli registration new
-#   (меняется WARP-identity и выходной IP из 104.28.0.0/16 — это нормально).
+#   2) Симптом: WARP вроде работает, но часть запросов падает (у нас на одном
+#      аплинке h3 давал 7/15 и 5/15). Причина: MASQUE over HTTP/3 (QUIC) нестабилен.
+#      Лечение: принудительно h2-only — MASQUE over HTTP/2 (TCP/443): 45/45.
 #
-#   Резервный сценарий, если WARP починить не удалось: --ru-direct —
-#   вставляет в /etc/sing-box/config.json правило «.ru/.su -> direct»
-#   (с бэкапом, sing-box check, restart и авто-откатом при ошибке).
+#   Резерв, если WARP починить не удалось: --ru-direct — правило «.ru/.su -> direct»
+#   в /etc/sing-box/config.json (бэкап, sing-box check, авто-откат).
 #
 # ИСПОЛЬЗОВАНИЕ
 #   ssb-warp-fix.sh                  # диагностика + ремонт (лестница) + проверка .ru
@@ -27,18 +26,24 @@
 #   ssb-warp-fix.sh --json           # короткий JSON-итог в stdout
 #   ssb-warp-fix.sh --ru-direct      # резерв: .ru/.su через direct в sing-box
 #   ssb-warp-fix.sh --ru-restore     # откатить --ru-direct
+#   ssb-warp-fix.sh --h2             # принудительно MASQUE over HTTP/2 (флапы h3)
 #   ssb-warp-fix.sh --no-e2e         # не проверять через цепочку sing-box
 #
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+#   WARP_PORT=40000  TIMEOUT=10  RU_THRESHOLD=80  STAB_TRIES=5  STAB_THRESHOLD=90
+#   LOG_FILE=/var/log/ssb-warp-fix.log
+#
 # КОДЫ ВОЗВРАТА
-#   0 — WARP здоров, .ru проходят порог
-#   1 — WARP отвечает, но .ru ниже порога (или часть проверок провалена)
+#   0 — WARP здоров, .ru проходят порог, стабильность в норме
+#   1 — WARP отвечает, но .ru/стабильность ниже порога
 #   2 — фатально: нет root / нет warp-cli / сервис не поднимается
 #
-# ТРЕБОВАНИЯ: Linux, warp-cli (2024+), curl, jq. root.
+# ОДНОЙ КОМАНДОЙ (свежий сервер):
+#   curl -fsSL https://raw.githubusercontent.com/Anton98567/ssb-warp-fix/main/ssb-warp-fix.sh | bash
 #
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.1"
 CONFIG_DEFAULT="/etc/sing-box/config.json"
 BOXLOG_DEFAULT="/var/lib/sing-box/box.log"
 BACKUP_DIR="/root"
@@ -47,7 +52,9 @@ BACKUP_PREFIX="sb-config-backup-ssbwarpfix"
 PROXY_HOST="127.0.0.1"
 WARP_PORT="${WARP_PORT:-40000}"
 TIMEOUT="${TIMEOUT:-10}"
-RU_THRESHOLD="${RU_THRESHOLD:-80}"      # % успешных .ru для вердикта "OK"
+RU_THRESHOLD="${RU_THRESHOLD:-80}"
+STAB_TRIES="${STAB_TRIES:-5}"
+STAB_THRESHOLD="${STAB_THRESHOLD:-90}"
 LOG_FILE="${LOG_FILE:-/var/log/ssb-warp-fix.log}"
 
 MODE="fix"            # fix | check
@@ -59,11 +66,12 @@ BOX_CONFIG="$CONFIG_DEFAULT"
 
 RU_HOSTS=(cheburcheck.ru yandex.ru ya.ru mail.ru ozon.ru wildberries.ru rbc.ru www.gosuslugi.ru avito.ru sber.ru)
 CTRL_HOSTS=(api.ipify.org www.cloudflare.com www.google.com github.com)
+STAB_HOSTS=(mail.ru yandex.ru cheburcheck.ru)
 
 C_OK=0; C_BAD=0; C_WARN=0
-declare -a SUMMARY=()
 RU_OK=0; RU_TOTAL=0
 NONRU_OK=0; NONRU_TOTAL=0
+STAB_OK=0; STAB_TOTAL=0
 E2E_OK=0; E2E_TOTAL=0
 WARP_IP=""
 VERDICT="unknown"
@@ -94,11 +102,12 @@ ssb-warp-fix — ремонт и проверка Cloudflare WARP (warp-cli) н�
   ssb-warp-fix --json           короткий JSON-итог в stdout
   ssb-warp-fix --ru-direct      резерв: .ru/.su через direct в sing-box
   ssb-warp-fix --ru-restore     откатить --ru-direct
+  ssb-warp-fix --h2             принудительно MASQUE over HTTP/2 (с автооткатом)
   ssb-warp-fix --no-e2e         не проверять через цепочку sing-box
   ssb-warp-fix --config PATH    другой путь к конфигу sing-box
 
 КОДЫ ВОЗВРАТА
-  0 WARP здоров и .ru проходят порог | 1 .ru ниже порога | 2 фатально
+  0 WARP здоров и .ru проходят порог | 1 .ru/стабильность ниже порога | 2 фатально
 
 ОДНОЙ КОМАНДОЙ (свежий сервер)
   curl -fsSL https://raw.githubusercontent.com/Anton98567/ssb-warp-fix/main/ssb-warp-fix.sh | bash
@@ -120,6 +129,7 @@ while [ $# -gt 0 ]; do
     --json)            JSON_OUT=1 ;;
     --ru-direct)       ACTION="ru-direct" ;;
     --ru-restore)      ACTION="ru-restore" ;;
+    --h2)              ACTION="h2" ;;
     -h|--help)         usage ;;
     -V|--version)      echo "ssb-warp-fix $VERSION"; exit 0 ;;
     *)                 die "неизвестный аргумент: $1 (--help)" ;;
@@ -141,8 +151,11 @@ http_code() {
 # reachable = любой HTTP-код 1xx-5xx (403/307/302 — тоже «дошли»)
 is_reachable() { case "$1" in [1-5][0-9][0-9]) return 0 ;; *) return 1 ;; esac; }
 
+pct() { [ "${2:-0}" -gt 0 ] && echo $(( $1 * 100 / $2 )) || echo 0; }
+
 probe_ctrl() {
-  local host code pass=0; NONRU_TOTAL=0; NONRU_OK=0
+  local host code pass=0
+  NONRU_TOTAL=0; NONRU_OK=0
   for host in "${CTRL_HOSTS[@]}"; do
     code=$(http_code "https://$host")
     NONRU_TOTAL=$((NONRU_TOTAL+1))
@@ -156,7 +169,8 @@ probe_ctrl() {
 }
 
 probe_ru() {
-  local host code pass=0; RU_TOTAL=0; RU_OK=0
+  local host code pass=0
+  RU_TOTAL=0; RU_OK=0
   for host in "${RU_HOSTS[@]}"; do
     code=$(http_code "https://$host")
     RU_TOTAL=$((RU_TOTAL+1))
@@ -166,13 +180,67 @@ probe_ru() {
       bad "$host -> нет ответа через WARP"
     fi
   done
-  [ "$RU_TOTAL" -gt 0 ] && [ $(( pass * 100 / RU_TOTAL )) -ge "$RU_THRESHOLD" ]
+  [ "$RU_TOTAL" -gt 0 ] && [ "$(pct "$pass" "$RU_TOTAL")" -ge "$RU_THRESHOLD" ]
+}
+
+# series: несколько попыток на домен — ловит «флап» (h3 нестабилен на части аплинков)
+probe_stability() {
+  local host code pass=0 total=0 i host_ok
+  STAB_OK=0; STAB_TOTAL=0
+  for host in "${STAB_HOSTS[@]}"; do
+    host_ok=0
+    for i in $(seq "$STAB_TRIES"); do
+      total=$((total+1))
+      code=$(http_code "https://$host")
+      if is_reachable "$code"; then pass=$((pass+1)); host_ok=$((host_ok+1)); fi
+    done
+    printf '  %-18s %d/%d\n' "$host" "$host_ok" "$STAB_TRIES"
+  done
+  STAB_OK=$pass; STAB_TOTAL=$total
+  local p; p=$(pct "$pass" "$total")
+  if [ "$p" -ge "$STAB_THRESHOLD" ]; then
+    ok "стабильность: $pass/$total (${p}%, порог ${STAB_THRESHOLD}%)"
+    return 0
+  fi
+  bad "стабильность: $pass/$total (${p}%, порог ${STAB_THRESHOLD}%)"
+  return 1
+}
+
+probe_all() { probe_ctrl; probe_ru; probe_stability; }
+
+healthy() {
+  [ "$NONRU_OK" -ge 3 ] \
+    && [ "$(pct "$RU_OK" "$RU_TOTAL")" -ge "$RU_THRESHOLD" ] \
+    && [ "$(pct "$STAB_OK" "$STAB_TOTAL")" -ge "$STAB_THRESHOLD" ]
 }
 
 # ------------------------------------------------------------- warp state ----
 warp_mode()     { warp settings 2>/dev/null | awk -F'\t' '/Mode:/ {print $2}' | head -1; }
 warp_protocol() { warp settings 2>/dev/null | awk -F': ' '/WARP tunnel protocol/ {print $2}' | head -1; }
+warp_http()     { warp settings 2>/dev/null | awk -F': ' '/HTTP Version/ {print $2}' | head -1; }
 warp_port_cfg() { warp settings 2>/dev/null | sed -n 's/.*WarpProxy on port \([0-9]*\).*/\1/p' | head -1; }
+
+# текущая MASQUE-опция в виде значения для "tunnel masque-options set"
+warp_masque_opt() {
+  local v
+  v=$(warp_http || true)
+  case "$v" in
+    *"HTTP/3 with HTTP/2 fallback"*) echo "h3-with-h2-fallback" ;;
+    *"HTTP/2"*)                      echo "h2-only" ;;
+    *"HTTP/3"*)                      echo "h3-only" ;;
+    *)                               echo "reset" ;;
+  esac
+}
+
+# быстрая проверка «WARP выпускает»: минимум 2 из 3 доменов
+quick_ok() {
+  local d c ok=0
+  for d in mail.ru yandex.ru cheburcheck.ru; do
+    c=$(http_code "https://$d")
+    is_reachable "$c" && ok=$((ok+1))
+  done
+  [ "$ok" -ge 2 ]
+}
 
 warp_connected() { warp status 2>/dev/null | grep -qi '^Status update: Connected'; }
 
@@ -197,21 +265,11 @@ warp_ip() {
 }
 
 reconnect() {
+  local limit="${1:-40}"
   warp disconnect >/dev/null 2>&1
   sleep 2
   warp connect >/dev/null 2>&1
-  wait_connected 40
-}
-
-ensure_proxy_mode() {
-  local changed=0
-  if ! warp_mode | grep -qi 'warpProxy on port'; then
-    warp mode proxy >/dev/null 2>&1 && changed=1
-  fi
-  if [ "$(warp_port_cfg)" != "$WARP_PORT" ]; then
-    warp proxy port "$WARP_PORT" >/dev/null 2>&1 && changed=1
-  fi
-  [ "$changed" -eq 1 ]
+  wait_connected "$limit"
 }
 
 # ---------------------------------------------------------------- sing-box ---
@@ -230,11 +288,11 @@ box_log_path() {
 
 box_log_lines() { [ -f "$1" ] && wc -l <"$1" || echo 0; }
 
-# E2E: поднимаем временный клиент sing-box, который ходит в родной trojan-inbound
-# этой же ноды, и проверяем .ru сквозь реальную цепочку (клиент -> нода -> WARP).
+# E2E: временный клиент sing-box ходит в родной trojan-inbound этой же ноды,
+# проверяем .ru сквозь реальную цепочку (клиент -> нода -> WARP) и лог.
 e2e_test() {
   local bin cfg_tmp log_tmp port user pass wpath mux ok_cnt=0 total=0
-  local logf log_before log_after code host
+  local logf log_before log_after code host pid
   bin=$(command -v sing-box 2>/dev/null) || { warn "sing-box не найден — E2E пропущен"; return 1; }
   [ -r "$BOX_CONFIG" ] || { warn "нет $BOX_CONFIG — E2E пропущен"; return 1; }
 
@@ -272,7 +330,7 @@ e2e_test() {
   fi
 
   "$bin" run -c "$cfg_tmp" >"$log_tmp" 2>&1 &
-  local pid=$!
+  pid=$!
   E2E_PID=$pid; E2E_TMP="$cfg_tmp $log_tmp"
 
   sleep 3
@@ -286,7 +344,8 @@ e2e_test() {
 
   for host in cheburcheck.ru yandex.ru ozon.ru wildberries.ru rbc.ru; do
     total=$((total+1))
-    code=$(curl -x "socks5h://127.0.0.1:${port}" -s -m "$TIMEOUT" -o /dev/null -w '%{http_code}' "https://$host" 2>/dev/null || echo 000)
+    code=$(curl -x "socks5h://127.0.0.1:${port}" -s -m "$TIMEOUT" -o /dev/null -w '%{http_code}' "https://$host" 2>/dev/null)
+    [ -n "$code" ] || code="000"
     if is_reachable "$code"; then ok_cnt=$((ok_cnt+1)); ok "  e2e $host -> $code"; else bad "  e2e $host -> нет ответа"; fi
   done
 
@@ -309,7 +368,7 @@ e2e_test() {
     fi
   fi
 
-  [ "$total" -gt 0 ] && [ $(( ok_cnt * 100 / total )) -ge "$RU_THRESHOLD" ]
+  [ "$total" -gt 0 ] && [ "$(pct "$ok_cnt" "$total")" -ge "$RU_THRESHOLD" ]
 }
 
 e2e_cleanup() {
@@ -320,9 +379,8 @@ e2e_cleanup() {
 }
 trap 'e2e_cleanup' EXIT
 
-# ---------------------------------------------------------------- fix ladder --
-ladder_config() {
-  hdr "Шаг 0: приводим режим/порт WARP к эталону (proxy, ${WARP_PORT})"
+# ---------------------------------------------------------------- fix steps --
+step_config() {
   local mode port changed=0
   mode=$(warp_mode || true)
   port=$(warp_port_cfg || true)
@@ -332,75 +390,93 @@ ladder_config() {
   if [ "$port" != "$WARP_PORT" ]; then
     warp proxy port "$WARP_PORT" >/dev/null 2>&1 && { ok "порт прокси -> $WARP_PORT"; changed=1; }
   fi
-  if [ "$changed" -eq 0 ]; then
-    info "настройки уже эталонные"
-    return 0
-  fi
-  reconnect && ok "WARP переподключён с новыми настройками" || bad "не поднялся после смены настроек"
+  if [ "$changed" -eq 0 ]; then info "настройки уже эталонные"; return 2; fi
+  reconnect && { ok "WARP переподключён с новыми настройками"; return 0; }
+  bad "не поднялся после смены настроек"; return 1
+}
+
+step_reconnect() {
+  reconnect && ok "WARP переподключён" || { bad "не поднялся за 40 c"; return 1; }
   sleep 2
-  probe_ctrl >/dev/null 2>&1 && probe_ru >/dev/null 2>&1
-  local pct=0; [ "$RU_TOTAL" -gt 0 ] && pct=$(( RU_OK * 100 / RU_TOTAL ))
-  [ "$pct" -ge "$RU_THRESHOLD" ] && [ "$NONRU_OK" -ge 3 ]
+  proxy_listening && ok "прокси слушает ${PROXY}" || { bad "прокси не слушает ${PROXY}"; return 1; }
 }
 
-ladder_reconnect() {
-  hdr "Шаг 1: переподключение WARP"
-  if reconnect; then ok "WARP переподключён"; else bad "WARP не поднялся за 40 c"; return 1; fi
-  sleep 2; proxy_listening && ok "прокси слушает ${PROXY}" || { bad "прокси не слушает ${PROXY}"; return 1; }
-  probe_ctrl >/dev/null && probe_ru >/dev/null
-  local rc=$?
-  [ "$rc" -eq 0 ] && ok ".ru проходят после переподключения" || warn ".ru всё ещё падают"
-  return "$rc"
-}
-
-ladder_masque_reset() {
-  hdr "Шаг 2: сброс MASQUE-опций (h3/h2) и переподключение"
+step_masque_reset() {
   warp tunnel masque-options reset >/dev/null 2>&1 || true
   warp tunnel protocol reset >/dev/null 2>&1 || true
   reconnect || { bad "не поднялся"; return 1; }
-  probe_ctrl >/dev/null && probe_ru >/dev/null
-  local rc=$?
-  [ "$rc" -eq 0 ] && ok ".ru проходят после сброса MASQUE" || warn ".ru всё ещё падают"
-  return "$rc"
 }
 
-ladder_reconnect_wg() {
-  hdr "Шаг 3: пробуем WireGuard-транспорт (если сеть не режет UDP)"
-  local old_proto; old_proto=$(warp_protocol)
+step_h2() {
+  local prev
+  prev=$(warp_masque_opt)
+  if [ "$prev" = "h2-only" ]; then info "уже включён h2-only"; return 2; fi
+  info "MASQUE h3 (QUIC) на части аплинков флапает — пробуем HTTP/2 (TCP/443)"
+  warp tunnel masque-options set h2-only >/dev/null 2>&1 || { bad "не смог выставить h2-only"; return 1; }
+  if reconnect 90 && proxy_listening && quick_ok; then
+    info "HTTP Version: $(warp_http || echo '?')"
+    return 0
+  fi
+  bad "на h2-only WARP не поднялся/не выпускает — откатываю на $prev"
+  warp tunnel masque-options set "$prev" >/dev/null 2>&1 \
+    || warp tunnel masque-options reset >/dev/null 2>&1
+  reconnect 90 >/dev/null 2>&1
+  if proxy_listening && quick_ok; then
+    ok "откат прошёл — WARP снова выпускает (остаёмся на $prev)"
+    return 1
+  fi
+  bad "откат не поднял WARP — нужен ручной разбор (warp-cli settings | grep 'HTTP Version')"
+  return 1
+}
+
+step_wireguard() {
   warp tunnel protocol set WireGuard >/dev/null 2>&1
   if reconnect; then
-    probe_ctrl >/dev/null && probe_ru >/dev/null
-    local rc=$?
-    if [ "$rc" -eq 0 ]; then ok "на WireGuard .ru проходят"; return 0; fi
-    warn "на WireGuard .ru не проходят"
-  else
-    warn "WireGuard не подключился (UDP закрыт у провайдера) — возвращаем $old_proto"
+    info "WireGuard подключился"
+    return 0
   fi
+  warn "WireGuard не подключился (UDP/2408 закрыт у провайдера) — возвращаем MASQUE"
   warp tunnel protocol reset >/dev/null 2>&1
   reconnect >/dev/null 2>&1
   return 1
 }
 
-ladder_reregister() {
-  hdr "Шаг 4: новая регистрация WARP (главное лечение)"
-  local old_id
+step_reregister() {
+  local old_id new_id
   old_id=$(warp registration show 2>/dev/null | awk -F': ' '/^ID:/ {print $2}')
   info "старый ID: ${old_id:-?}"
   warp disconnect >/dev/null 2>&1
   warp registration delete >/dev/null 2>&1
-  if ! warp registration new >/dev/null 2>&1; then
-    bad "registration new не удался (нет сети/блокировка Cloudflare API)"
+  warp registration new >/dev/null 2>&1 || { bad "registration new не удался (нет сети/блокировка Cloudflare API)"; return 1; }
+  warp mode proxy >/dev/null 2>&1
+  warp proxy port "$WARP_PORT" >/dev/null 2>&1
+  reconnect || { bad "после перерегистрации WARP не поднялся"; return 1; }
+  sleep 2
+  new_id=$(warp registration show 2>/dev/null | awk -F': ' '/^ID:/ {print $2}')
+  ok "новая регистрация: ${new_id:-?}"
+}
+
+# run_step <имя> <функция>: выполняет шаг и заново замеряет
+#   0 = шаг применён и WARP здоров, 1 = не помогло, 2 = шаг не требуется (без изменений)
+run_step() {
+  hdr "$1"
+  "$2"
+  local rc=$?
+  if [ "$rc" -eq 2 ]; then
+    info "шаг не требуется — пропускаем"
     return 1
   fi
-  ensure_proxy_mode >/dev/null 2>&1
-  if ! reconnect; then bad "после перерегистрации WARP не поднялся"; return 1; fi
-  sleep 2
-  local new_id; new_id=$(warp registration show 2>/dev/null | awk -F': ' '/^ID:/ {print $2}')
-  ok "новая регистрация: ${new_id:-?}"
-  probe_ctrl >/dev/null && probe_ru >/dev/null
-  local rc=$?
-  [ "$rc" -eq 0 ] && ok ".ru проходят после перерегистрации" || bad ".ru не проходят даже после перерегистрации"
-  return "$rc"
+  if [ "$rc" -ne 0 ]; then
+    warn "шаг не удался"
+    return 1
+  fi
+  probe_all
+  if healthy; then
+    ok "после шага WARP здоров (.ru $(pct "$RU_OK" "$RU_TOTAL")%, стабильность $(pct "$STAB_OK" "$STAB_TOTAL")%)"
+    return 0
+  fi
+  warn "после шага: .ru $(pct "$RU_OK" "$RU_TOTAL")%, стабильность $(pct "$STAB_OK" "$STAB_TOTAL")%"
+  return 1
 }
 
 # -------------------------------------------------------------- ru-direct ----
@@ -419,28 +495,27 @@ box_restart() {
 ru_direct_apply() {
   hdr "Резервный режим: .ru/.su -> direct в sing-box"
   [ -r "$BOX_CONFIG" ] || die "нет $BOX_CONFIG"
-  local backup
+  local backup tmp
   backup=$(box_backup) || die "не смог сделать бэкап конфига"
   info "бэкап: $backup"
 
-  local tmp; tmp=$(mktemp)
+  tmp=$(mktemp)
   jq '
-    .route.rules = (
-      [{domain_suffix: [".ru", ".su", ".ru.com", ".ru.net", "ntc.party"], outbound: "direct"}]
-      + (.route.rules // [])
-    )
-    | .route.rules |= (
-        reduce .[] as $r (
+    .route.rules |= (
+      ([{domain_suffix: [".ru", ".su", ".ru.com", ".ru.net", "ntc.party"], outbound: "direct"}]
+       + .) as $all
+      | reduce $all[] as $r (
           [];
           if (($r.domain_suffix // []) == [".ru", ".su", ".ru.com", ".ru.net", "ntc.party"] and $r.outbound == "direct")
-          then (if any(.[]; (.domain_suffix // []) == [".ru", ".su", ".ru.com", ".ru.net", "ntc.party"] and .outbound == "direct") then . else . + [$r] end)
+          then (if any(.[]; (.domain_suffix // []) == [".ru", ".su", ".ru.com", ".ru.net", "ntc.party"] and .outbound == "direct")
+                then . else . + [$r] end)
           else . + [$r]
           end
         )
-      )
-  ' "$BOX_CONFIG" >"$tmp" || die "jq не смог обработать конфиг"
+    )
+  ' "$BOX_CONFIG" >"$tmp" || { rm -f "$tmp"; die "jq не смог обработать конфиг"; }
 
-  if ! jq -e . "$tmp" >/dev/null 2>&1; then rm -f "$tmp"; die "получился невалидный JSON — конфиг не тронут"; fi
+  jq -e . "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "получился невалидный JSON — конфиг не тронут"; }
   cat "$tmp" >"$BOX_CONFIG"; rm -f "$tmp"
 
   if ! sing-box check -c "$BOX_CONFIG" >/dev/null 2>&1; then
@@ -459,16 +534,29 @@ ru_direct_apply() {
   info "откат: $0 --ru-restore   (или cp $backup $BOX_CONFIG)"
 }
 
+action_h2() {
+  hdr "Принудительно MASQUE over HTTP/2 (h2-only)"
+  step_h2 || return 1
+  probe_all
+  WARP_IP=$(warp_ip); [ -n "$WARP_IP" ] && info "WARP exit IP: $WARP_IP"
+  if healthy; then
+    ok "h2-only: .ru $(pct "$RU_OK" "$RU_TOTAL")%, стабильность $(pct "$STAB_OK" "$STAB_TOTAL")%"
+    return 0
+  fi
+  bad "h2-only не помог: .ru $(pct "$RU_OK" "$RU_TOTAL")%, стабильность $(pct "$STAB_OK" "$STAB_TOTAL")%"
+  return 1
+}
+
 ru_direct_restore() {
   hdr "Откат резервного режима .ru -> direct"
   [ -r "$BOX_CONFIG" ] || die "нет $BOX_CONFIG"
-  local backup
+  local backup tmp
   backup=$(ls -1t "${BACKUP_DIR}/${BACKUP_PREFIX}"-*.json 2>/dev/null | head -1)
   [ -n "$backup" ] || die "не нашёл бэкап ${BACKUP_DIR}/${BACKUP_PREFIX}-*.json"
 
-  local tmp; tmp=$(mktemp)
+  tmp=$(mktemp)
   jq '.route.rules |= map(select(((.domain_suffix // []) != [".ru", ".su", ".ru.com", ".ru.net", "ntc.party"]) or .outbound != "direct"))' \
-      "$BOX_CONFIG" >"$tmp" || die "jq не смог обработать конфиг"
+      "$BOX_CONFIG" >"$tmp" || { rm -f "$tmp"; die "jq не смог обработать конфиг"; }
   jq -e . "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; die "невалидный JSON — конфиг не тронут"; }
   cat "$tmp" >"$BOX_CONFIG"; rm -f "$tmp"
 
@@ -489,105 +577,90 @@ say "ssb-warp-fix $VERSION — режим: $MODE, прокси ${PROXY}"
 
 if [ "$ACTION" = "ru-direct" ];  then ru_direct_apply;   exit $?; fi
 if [ "$ACTION" = "ru-restore" ]; then ru_direct_restore; exit $?; fi
+if [ "$ACTION" = "h2" ];         then action_h2;         exit $?; fi
 
-# --- 0. preflight
 hdr "0. Состояние WARP до вмешательства"
 systemctl is-active --quiet warp-svc && ok "warp-svc active" || bad "warp-svc не active"
 warp_connected && ok "туннель: Connected" || bad "туннель: не Connected"
 info "режим: $(warp_mode || echo '?')"
-info "протокол: $(warp_protocol || echo '?')"
+info "протокол: $(warp_protocol || echo '?'), MASQUE $([ -n "$(warp_http || true)" ] && echo "$(warp_http)" || echo '-')"
 info "порт в настройках: $(warp_port_cfg || echo '?'), ожидаем $WARP_PORT"
 proxy_listening && ok "SOCKS-прокси слушает ${PROXY}" || bad "SOCKS-прокси не слушает ${PROXY}"
 
 if [ "$MODE" = "check" ]; then
   hdr "Проверка выхода через WARP (без изменений)"
-  probe_ctrl
-  probe_ru
+  probe_all
   WARP_IP=$(warp_ip); [ -n "$WARP_IP" ] && info "WARP exit IP: $WARP_IP"
   if [ "$DO_E2E" != "never" ]; then
     hdr "Сквозной тест через sing-box (клиент -> нода -> WARP)"
     if e2e_test; then ok "E2E: .ru идут через WARP (${E2E_OK}/${E2E_TOTAL})"; else warn "E2E: .ru ниже порога (${E2E_OK}/${E2E_TOTAL})"; fi
     e2e_cleanup
   fi
-  RU_PCT=0; [ "$RU_TOTAL" -gt 0 ] && RU_PCT=$(( RU_OK * 100 / RU_TOTAL ))
-  if [ "$RU_PCT" -ge "$RU_THRESHOLD" ]; then VERDICT="ok"; else VERDICT="broken"; fi
   hdr "Итог"
-  printf '  WARP exit: %s\n  контрольные домены: %d/%d\n  .ru домены: %d/%d (%d%%)\n' \
-    "${WARP_IP:-?}" "$NONRU_OK" "$NONRU_TOTAL" "$RU_OK" "$RU_TOTAL" "$RU_PCT"
-  [ "$E2E_TOTAL" -gt 0 ] && printf '  сквозной тест: %d/%d\n' "$E2E_OK" "$E2E_TOTAL"
-  [ "$JSON_OUT" -eq 1 ] && printf '{"verdict":"%s","warp_ip":"%s","ru_ok":%d,"ru_total":%d,"nonru_ok":%d,"nonru_total":%d,"e2e_ok":%d,"e2e_total":%d}\n' \
-    "$VERDICT" "$WARP_IP" "$RU_OK" "$RU_TOTAL" "$NONRU_OK" "$NONRU_TOTAL" "$E2E_OK" "$E2E_TOTAL"
+  printf '  WARP exit           : %s\n' "${WARP_IP:-?}"
+  printf '  контрольные домены  : %d/%d\n' "$NONRU_OK" "$NONRU_TOTAL"
+  printf '  .ru через WARP      : %d/%d (%d%%, порог %d%%)\n' "$RU_OK" "$RU_TOTAL" "$(pct "$RU_OK" "$RU_TOTAL")" "$RU_THRESHOLD"
+  printf '  стабильность        : %d/%d (%d%%, порог %d%%)\n' "$STAB_OK" "$STAB_TOTAL" "$(pct "$STAB_OK" "$STAB_TOTAL")" "$STAB_THRESHOLD"
+  [ "$E2E_TOTAL" -gt 0 ] && printf '  сквозной тест       : %d/%d\n' "$E2E_OK" "$E2E_TOTAL"
+  if healthy; then VERDICT="ok"; else VERDICT="broken"; fi
+  [ "$JSON_OUT" -eq 1 ] && printf '{"verdict":"%s","warp_ip":"%s","ru_ok":%d,"ru_total":%d,"stab_ok":%d,"stab_total":%d,"nonru_ok":%d,"nonru_total":%d,"e2e_ok":%d,"e2e_total":%d}\n' \
+    "$VERDICT" "$WARP_IP" "$RU_OK" "$RU_TOTAL" "$STAB_OK" "$STAB_TOTAL" "$NONRU_OK" "$NONRU_TOTAL" "$E2E_OK" "$E2E_TOTAL"
   [ "$VERDICT" = "ok" ] && exit 0 || exit 1
 fi
 
-# --- 1. базовый замер
 hdr "1. Базовый замер (до ремонта)"
-probe_ctrl
-BASE_RU_OK=$RU_OK; probe_ru; BASE_RU_OK=$RU_OK
-BASE_PCT=0; [ "$RU_TOTAL" -gt 0 ] && BASE_PCT=$(( RU_OK * 100 / RU_TOTAL ))
-info "базлайн: контроль $NONRU_OK/$NONRU_TOTAL, .ru $RU_OK/$RU_TOTAL (${BASE_PCT}%)"
-
+probe_all
 FIXED=0
-if [ "$BASE_PCT" -ge "$RU_THRESHOLD" ] && [ "$NONRU_OK" -ge 3 ]; then
+if healthy; then
   ok "WARP уже здоров — ремонт не требуется"
   FIXED=1
 fi
 
-if [ "$FIXED" -eq 0 ]; then
-  ladder_config && FIXED=1
-fi
-if [ "$FIXED" -eq 0 ]; then
-  ladder_reconnect && FIXED=1
-fi
-if [ "$FIXED" -eq 0 ]; then
-  ladder_masque_reset && FIXED=1
-fi
-if [ "$FIXED" -eq 0 ]; then
-  ladder_reconnect_wg && FIXED=1
-fi
+[ "$FIXED" -eq 0 ] && run_step "Шаг 1: режим/порт WARP"        step_config       && FIXED=1
+[ "$FIXED" -eq 0 ] && run_step "Шаг 2: переподключение"        step_reconnect    && FIXED=1
+[ "$FIXED" -eq 0 ] && run_step "Шаг 3: сброс MASQUE-опций"     step_masque_reset && FIXED=1
+[ "$FIXED" -eq 0 ] && run_step "Шаг 4: MASQUE over HTTP/2 (h2-only)" step_h2     && FIXED=1
+[ "$FIXED" -eq 0 ] && run_step "Шаг 5: WireGuard-транспорт"    step_wireguard    && FIXED=1
 if [ "$FIXED" -eq 0 ]; then
   if [ "$DO_REREGISTER" = "never" ]; then
     warn "перерегистрация отключена (--no-reregister), WARP остаётся сломанным"
   else
-    ladder_reregister && FIXED=1
+    run_step "Шаг 6: новая регистрация WARP" step_reregister && FIXED=1
   fi
 fi
 
-# --- 2. финальная матрица
 hdr "2. Финальная проверка .ru через WARP"
-probe_ctrl
-probe_ru
+probe_all
 WARP_IP=$(warp_ip)
 [ -n "$WARP_IP" ] && info "WARP exit IP: $WARP_IP"
 warp tunnel stats 2>/dev/null | grep -E 'Tunnel Protocol|Colo|Estimated loss|handshake' | while read -r l; do info "$l"; done
 
-FINAL_PCT=0; [ "$RU_TOTAL" -gt 0 ] && FINAL_PCT=$(( RU_OK * 100 / RU_TOTAL ))
-
-# --- 3. E2E через цепочку ноды
 if [ "$DO_E2E" != "never" ]; then
   hdr "3. Сквозной тест через sing-box (клиент -> нода -> WARP)"
   if e2e_test; then ok "E2E: .ru идут через WARP (${E2E_OK}/${E2E_TOTAL})"; else warn "E2E: .ru ниже порога (${E2E_OK}/${E2E_TOTAL})"; fi
   e2e_cleanup
 fi
 
-# --- 4. вердикт
 hdr "4. Итог"
-printf '  WARP exit IP        : %s\n' "${WARP_IP:-нет}"
-printf '  контрольные домены  : %d/%d\n' "$NONRU_OK" "$NONRU_TOTAL"
-printf '  .ru домены через WARP: %d/%d (%d%%, порог %d%%)\n' "$RU_OK" "$RU_TOTAL" "$FINAL_PCT" "$RU_THRESHOLD"
-[ "$E2E_TOTAL" -gt 0 ] && printf '  сквозной тест       : %d/%d\n' "$E2E_OK" "$E2E_TOTAL"
+printf '  WARP exit IP          : %s\n' "${WARP_IP:-нет}"
+printf '  MASQUE HTTP version   : %s\n' "$(warp_http || echo '-')"
+printf '  контрольные домены    : %d/%d\n' "$NONRU_OK" "$NONRU_TOTAL"
+printf '  .ru через WARP        : %d/%d (%d%%, порог %d%%)\n' "$RU_OK" "$RU_TOTAL" "$(pct "$RU_OK" "$RU_TOTAL")" "$RU_THRESHOLD"
+printf '  стабильность          : %d/%d (%d%%, порог %d%%)\n' "$STAB_OK" "$STAB_TOTAL" "$(pct "$STAB_OK" "$STAB_TOTAL")" "$STAB_THRESHOLD"
+[ "$E2E_TOTAL" -gt 0 ] && printf '  сквозной тест         : %d/%d\n' "$E2E_OK" "$E2E_TOTAL"
 
-if [ "$FINAL_PCT" -ge "$RU_THRESHOLD" ]; then
+if healthy; then
   VERDICT="ok"
   printf '\n\033[32mWARP РАБОТАЕТ\033[0m — .ru открываются через WARP (%s)\n' "${WARP_IP:-?}"
-  [ "$JSON_OUT" -eq 1 ] && printf '{"verdict":"ok","warp_ip":"%s","ru_ok":%d,"ru_total":%d,"nonru_ok":%d,"nonru_total":%d,"e2e_ok":%d,"e2e_total":%d,"fixed":%d}\n' \
-    "${WARP_IP:-}" "$RU_OK" "$RU_TOTAL" "$NONRU_OK" "$NONRU_TOTAL" "$E2E_OK" "$E2E_TOTAL" "$FIXED"
+  [ "$JSON_OUT" -eq 1 ] && printf '{"verdict":"ok","warp_ip":"%s","ru_ok":%d,"ru_total":%d,"stab_ok":%d,"stab_total":%d,"nonru_ok":%d,"nonru_total":%d,"e2e_ok":%d,"e2e_total":%d,"fixed":%d}\n' \
+    "${WARP_IP:-}" "$RU_OK" "$RU_TOTAL" "$STAB_OK" "$STAB_TOTAL" "$NONRU_OK" "$NONRU_TOTAL" "$E2E_OK" "$E2E_TOTAL" "$FIXED"
   exit 0
 fi
 
 VERDICT="broken"
-printf '\n\033[31mWARP НЕ РАБОТАЕТ КАК НУЖНО\033[0m — .ru %d/%d (%d%%)\n' "$RU_OK" "$RU_TOTAL" "$FINAL_PCT"
+printf '\n\033[31mWARP НЕ РАБОТАЕТ КАК НУЖНО\033[0m — .ru %d/%d, стабильность %d/%d\n' \
+  "$RU_OK" "$RU_TOTAL" "$STAB_OK" "$STAB_TOTAL"
 info "Рекомендация: перевести .ru/.su на прямой маршрут:  $0 --ru-direct"
-[ "$JSON_OUT" -eq 1 ] && printf '{"verdict":"broken","warp_ip":"%s","ru_ok":%d,"ru_total":%d,"nonru_ok":%d,"nonru_total":%d,"e2e_ok":%d,"e2e_total":%d,"fixed":%d}\n' \
-  "${WARP_IP:-}" "$RU_OK" "$RU_TOTAL" "$NONRU_OK" "$NONRU_TOTAL" "$E2E_OK" "$E2E_TOTAL" "$FIXED"
+[ "$JSON_OUT" -eq 1 ] && printf '{"verdict":"broken","warp_ip":"%s","ru_ok":%d,"ru_total":%d,"stab_ok":%d,"stab_total":%d,"nonru_ok":%d,"nonru_total":%d,"e2e_ok":%d,"e2e_total":%d,"fixed":%d}\n' \
+  "${WARP_IP:-}" "$RU_OK" "$RU_TOTAL" "$STAB_OK" "$STAB_TOTAL" "$NONRU_OK" "$NONRU_TOTAL" "$E2E_OK" "$E2E_TOTAL" "$FIXED"
 exit 1
