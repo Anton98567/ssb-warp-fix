@@ -82,7 +82,29 @@ die() { printf '\033[31mОШИБКА:\033[0m %s\n' "$*" >&2; exit 2; }
 
 warp() { warp-cli --accept-tos "$@"; }
 
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() {
+  cat <<'USAGE'
+ssb-warp-fix — ремонт и проверка Cloudflare WARP (warp-cli) на Linux-ноде
+
+ИСПОЛЬЗОВАНИЕ
+  ssb-warp-fix                  диагностика + ремонт (лестница) + проверка .ru
+  ssb-warp-fix --check          только чтение: диагностика и проверка
+  ssb-warp-fix --no-reregister  ремонт без смены WARP-регистрации
+  ssb-warp-fix --port 40000     другой порт SOCKS-прокси WARP
+  ssb-warp-fix --json           короткий JSON-итог в stdout
+  ssb-warp-fix --ru-direct      резерв: .ru/.su через direct в sing-box
+  ssb-warp-fix --ru-restore     откатить --ru-direct
+  ssb-warp-fix --no-e2e         не проверять через цепочку sing-box
+  ssb-warp-fix --config PATH    другой путь к конфигу sing-box
+
+КОДЫ ВОЗВРАТА
+  0 WARP здоров и .ru проходят порог | 1 .ru ниже порога | 2 фатально
+
+ОДНОЙ КОМАНДОЙ (свежий сервер)
+  curl -fsSL https://raw.githubusercontent.com/Anton98567/ssb-warp-fix/main/ssb-warp-fix.sh | bash
+USAGE
+  exit 0
+}
 
 # --------------------------------------------------------------- args --------
 while [ $# -gt 0 ]; do
